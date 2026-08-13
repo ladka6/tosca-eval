@@ -1,9 +1,11 @@
 import copy
 import logging
+import time
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+from torch.utils.flop_counter import FlopCounterMode
 from utils.toolkit import tensor2numpy, accuracy
 from scipy.spatial.distance import cdist
 
@@ -22,6 +24,9 @@ class BaseLearner(object):
         self._device = args["device"][0]
         self._multiple_gpus = args["device"]
         self.args = args
+
+        # Cost metrics for the task just trained/evaluated.
+        self.metrics = {}
 
     @property
     def samples_per_class(self):
@@ -62,7 +67,14 @@ class BaseLearner(object):
         return ret
 
     def eval_task(self):
+        eval_start = time.time()
         y_pred, y_true = self._eval_cnn(self.test_loader)
+        eval_time = time.time() - eval_start
+
+        n_samples = len(y_true)
+        self.metrics["eval_ms_per_sample"] = (eval_time / n_samples) * 1000 if n_samples else 0.0
+        self.metrics["inference_gflops"] = self._measure_inference_gflops()
+
         cnn_accy = self._evaluate(y_pred, y_true)
 
         if hasattr(self, "_class_means"):
@@ -72,6 +84,17 @@ class BaseLearner(object):
             nme_accy = None
 
         return cnn_accy, nme_accy
+
+    def _measure_inference_gflops(self):
+        # Re-runs whatever `_eval_cnn` does (which may itself be overridden by a
+        # subclass, e.g. an ensemble over multiple task-specific blocks) on a
+        # single sample so the FLOP count reflects the real inference cost.
+        single_sample_loader = DataLoader(
+            Subset(self.test_loader.dataset, [0]), batch_size=1, shuffle=False
+        )
+        with FlopCounterMode(display=False) as flop_counter:
+            self._eval_cnn(single_sample_loader)
+        return flop_counter.get_total_flops() / 1e9
 
     def incremental_train(self):
         pass

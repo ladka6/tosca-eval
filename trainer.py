@@ -66,7 +66,19 @@ def _train(args):
     cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
     cnn_matrix, nme_matrix = [], []
 
+    cost_curve = {
+        "train_time_min": [],
+        "eval_ms_per_sample": [],
+        "inference_gflops": [],
+        "train_gflops": [],
+        "peak_train_mem_mb": [],
+        "params_m": [],
+        "trainable_params_m": [],
+    }
+
     for task in range(data_manager.nb_tasks):
+        params_m = count_parameters(model._network) / 1e6
+        trainable_params_m = count_parameters(model._network, True) / 1e6
         logging.info("All params: {}".format(count_parameters(model._network)))
         logging.info(
             "Trainable params: {}".format(count_parameters(model._network, True))
@@ -74,6 +86,29 @@ def _train(args):
         model.incremental_train(data_manager)
         cnn_accy, nme_accy = model.eval_task()
         model.after_task()
+
+        cost_curve["train_time_min"].append(model.metrics.get("train_time_min", 0.0))
+        cost_curve["eval_ms_per_sample"].append(model.metrics.get("eval_ms_per_sample", 0.0))
+        cost_curve["inference_gflops"].append(model.metrics.get("inference_gflops", 0.0))
+        cost_curve["train_gflops"].append(model.metrics.get("train_gflops", 0.0))
+        cost_curve["peak_train_mem_mb"].append(model.metrics.get("peak_train_mem_mb", 0.0))
+        cost_curve["params_m"].append(params_m)
+        cost_curve["trainable_params_m"].append(trainable_params_m)
+
+        logging.info(
+            "Task {} cost metrics: Train Time {:.2f} min, Eval {:.2f} ms/smp, "
+            "Inference {:.3f} GFLOPs, Train {:.3f} GFLOPs, Peak Train Mem {:.1f} MB, "
+            "Params {:.2f} M, Trainable Params {:.2f} M".format(
+                task,
+                cost_curve["train_time_min"][-1],
+                cost_curve["eval_ms_per_sample"][-1],
+                cost_curve["inference_gflops"][-1],
+                cost_curve["train_gflops"][-1],
+                cost_curve["peak_train_mem_mb"][-1],
+                params_m,
+                trainable_params_m,
+            )
+        )
 
         if nme_accy is not None:
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
@@ -119,6 +154,18 @@ def _train(args):
 
             print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
             logging.info("Average Accuracy (CNN): {} \n".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
+
+    summary = {
+        "Train Time (min)": sum(cost_curve["train_time_min"]),
+        "Eval (ms/smp)": np.mean(cost_curve["eval_ms_per_sample"]),
+        "Inference (GFLOPs)": np.mean(cost_curve["inference_gflops"]),
+        "Train (GFLOPs)": np.mean(cost_curve["train_gflops"]),
+        "Peak Train Mem. (MB)": max(cost_curve["peak_train_mem_mb"]),
+        "Params (M)": cost_curve["params_m"][-1],
+        "Trainable Params (M)": cost_curve["trainable_params_m"][-1],
+    }
+    print("Cost summary:", summary)
+    logging.info("Cost summary: {}".format(summary))
 
     if 'print_forget' in args.keys() and args['print_forget'] is True:
         if len(cnn_matrix) > 0:

@@ -1,10 +1,12 @@
 import logging
+import time
 import numpy as np
 import torch
 from tqdm import tqdm
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
+from torch.utils.flop_counter import FlopCounterMode
 from utils.inc_net import SimpleVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
@@ -27,7 +29,7 @@ class Learner(BaseLearner):
         self.train_loader = DataLoader(self.train_dataset, batch_size=self.args["batch_size"], shuffle=True, num_workers=num_workers)
 
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test" )
-        self.test_loader = DataLoader(test_dataset, batch_size=48, shuffle=False, num_workers=num_workers)
+        self.test_loader = DataLoader(test_dataset, batch_size=48, shuffle=True, num_workers=num_workers)
 
         train_dataset_for_protonet = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes),source="train", mode="test", )
         self.train_loader_for_protonet = DataLoader(train_dataset_for_protonet, batch_size=self.args["batch_size"], shuffle=True, num_workers=num_workers)
@@ -39,6 +41,10 @@ class Learner(BaseLearner):
         optimizer = self.get_optimizer(lr=self.args["lr"])
         scheduler = self.get_scheduler(optimizer, self.args["epochs"])
 
+        if self._device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self._device)
+        train_start = time.time()
+
         prog_bar = tqdm(range(self.args["epochs"]))
         for _, epoch in enumerate(prog_bar):
             self._network.train()
@@ -48,6 +54,13 @@ class Learner(BaseLearner):
                 inputs, targets = inputs.to(self._device), targets.long().to(self._device)
 
                 optimizer.zero_grad()
+
+                if epoch == 0 and i == 0:
+                    self.metrics["train_gflops"] = self._measure_train_step_gflops(
+                        inputs[:1], targets[:1]
+                    )
+                    optimizer.zero_grad()
+
                 logits = self._network(inputs)["logits"]
                 loss = F.cross_entropy(logits, targets)
                 l1_loss = sum(p.abs().sum() for p in self._network.backbone.tosca.parameters())
@@ -82,9 +95,25 @@ class Learner(BaseLearner):
                     train_acc,
                 )
             prog_bar.set_description(info)
+
+        self.metrics["train_time_min"] = (time.time() - train_start) / 60
+        self.metrics["peak_train_mem_mb"] = (
+            torch.cuda.max_memory_allocated(self._device) / (1024 ** 2)
+            if self._device.type == "cuda"
+            else 0.0
+        )
+
         logging.info(info)
         self._save_tosca()
         self.replace_fc()
+
+    def _measure_train_step_gflops(self, sample_inputs, sample_targets):
+        with FlopCounterMode(display=False) as flop_counter:
+            sample_logits = self._network(sample_inputs)["logits"]
+            sample_loss = F.cross_entropy(sample_logits, sample_targets)
+            sample_l1 = sum(p.abs().sum() for p in self._network.backbone.tosca.parameters())
+            (sample_loss + self.args["l1"] * sample_l1).backward()
+        return flop_counter.get_total_flops() / 1e9
 
     def after_task(self):
         self._network.backbone.reset_tosca()
