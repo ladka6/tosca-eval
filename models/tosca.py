@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 import numpy as np
 import torch
@@ -201,18 +202,28 @@ class Learner(BaseLearner):
 
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
 
+    def _ckpt_dir(self):
+        # Namespaced per (dataset, prefix, seed) so concurrent runs -- e.g. a
+        # 5-seed SLURM array for the same dataset -- never share a task{i}.pth
+        # path and silently clobber each other's checkpoints.
+        ckpt_dir = "tosca/{}__{}__seed{}".format(
+            self.args["dataset"], self.args["prefix"], self.args["seed"]
+        )
+        os.makedirs(ckpt_dir, exist_ok=True)
+        return ckpt_dir
+
     def _save_tosca(self):
-        path = f"tosca/task{self._cur_task}.pth"
+        path = f"{self._ckpt_dir()}/task{self._cur_task}.pth"
         tosca_state_dict = {
-            name: param 
-            for name, param in self._network.state_dict().items() 
+            name: param
+            for name, param in self._network.state_dict().items()
             if 'tosca' in name
         }
         torch.save(tosca_state_dict, path)
         logging.info(f"tosca parameters saved to {path}.")
 
     def _load_tosca(self, idx):
-        path = f"tosca/task{idx}.pth"
+        path = f"{self._ckpt_dir()}/task{idx}.pth"
         tosca_state_dict = torch.load(path)
         current_state_dict = self._network.state_dict()
         current_state_dict.update(tosca_state_dict)

@@ -5,12 +5,15 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=40G
 #SBATCH --time=12:00:00
-#SBATCH --output=logs/%x-%j.out
-#SBATCH --error=logs/%x-%j.err
+#SBATCH --array=0-4
+#SBATCH --output=logs/%x-%A_%a.out
+#SBATCH --error=logs/%x-%A_%a.err
 
 set -euo pipefail
 
 cd "$HOME/tosca-eval"
 source .venv/bin/activate
+mkdir -p logs
 
-python main.py --config exps/tosca_inr.json
+SEED=$((1993 + SLURM_ARRAY_TASK_ID))
+python main.py --config exps/tosca_inr.json --seed "$SEED"

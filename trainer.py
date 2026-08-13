@@ -25,8 +25,9 @@ def _train(args):
     logs_name = "logs/{}/{}/{}/{}".format(args["model_name"],args["dataset"], init_cls, args['increment'])
     
     os.makedirs("tosca", exist_ok=True)
-    if not os.path.exists(logs_name):
-        os.makedirs(logs_name)
+    # exist_ok=True: concurrent array tasks (5 seeds of the same dataset)
+    # share this directory and race to create it if checked-then-created.
+    os.makedirs(logs_name, exist_ok=True)
 
     logfilename = "logs/{}/{}/{}/{}/{}_{}_{}".format(
         args["model_name"],
@@ -70,7 +71,7 @@ def _train(args):
         "train_time_min": [],
         "eval_ms_per_sample": [],
         "inference_gflops": [],
-        "train_gflops": [],
+        "train_gflops_total": [],
         "peak_train_mem_mb": [],
         "params_m": [],
         "trainable_params_m": [],
@@ -84,26 +85,39 @@ def _train(args):
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
         model.incremental_train(data_manager)
+        train_samples = len(model.train_loader.dataset)
         cnn_accy, nme_accy = model.eval_task()
         model.after_task()
+
+        # "Train (GFLOPs)" in the paper's efficiency table (and in
+        # continue_learning/aggregate_results.py) is the TOTAL FLOPs summed
+        # over every sample x every epoch of the whole run, not a single
+        # representative step -- e.g. SimpleCIL's 1.76e6 = ~35.14
+        # GFLOPs/sample x 50,000 CIFAR-100 train images. model.metrics
+        # ["train_gflops"] is the real measured forward+backward cost of ONE
+        # sample (via FlopCounterMode on the task's first training step);
+        # scale it up to this task's total before summing across tasks.
+        task_train_gflops_total = (
+            model.metrics.get("train_gflops", 0.0) * train_samples * args["epochs"]
+        )
 
         cost_curve["train_time_min"].append(model.metrics.get("train_time_min", 0.0))
         cost_curve["eval_ms_per_sample"].append(model.metrics.get("eval_ms_per_sample", 0.0))
         cost_curve["inference_gflops"].append(model.metrics.get("inference_gflops", 0.0))
-        cost_curve["train_gflops"].append(model.metrics.get("train_gflops", 0.0))
+        cost_curve["train_gflops_total"].append(task_train_gflops_total)
         cost_curve["peak_train_mem_mb"].append(model.metrics.get("peak_train_mem_mb", 0.0))
         cost_curve["params_m"].append(params_m)
         cost_curve["trainable_params_m"].append(trainable_params_m)
 
         logging.info(
             "Task {} cost metrics: Train Time {:.2f} min, Eval {:.2f} ms/smp, "
-            "Inference {:.3f} GFLOPs, Train {:.3f} GFLOPs, Peak Train Mem {:.1f} MB, "
-            "Params {:.2f} M, Trainable Params {:.2f} M".format(
+            "Inference {:.3f} GFLOPs, Train (this task, total) {:.3f} GFLOPs, "
+            "Peak Train Mem {:.1f} MB, Params {:.2f} M, Trainable Params {:.2f} M".format(
                 task,
                 cost_curve["train_time_min"][-1],
                 cost_curve["eval_ms_per_sample"][-1],
                 cost_curve["inference_gflops"][-1],
-                cost_curve["train_gflops"][-1],
+                cost_curve["train_gflops_total"][-1],
                 cost_curve["peak_train_mem_mb"][-1],
                 params_m,
                 trainable_params_m,
@@ -155,11 +169,17 @@ def _train(args):
             print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
             logging.info("Average Accuracy (CNN): {} \n".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
 
+    # Matches the aggregation basis used in continue_learning/aggregate_results.py
+    # (and the paper's Table 2), so these numbers are directly comparable:
+    # Train Time = summed wall-clock over the whole run; Eval/Inference =
+    # LAST task's value (the fully-deployed model's cost, not an average
+    # over the run's history); Peak Mem = max over the run; Params = final
+    # task's (cumulative) count.
     summary = {
         "Train Time (min)": sum(cost_curve["train_time_min"]),
-        "Eval (ms/smp)": np.mean(cost_curve["eval_ms_per_sample"]),
-        "Inference (GFLOPs)": np.mean(cost_curve["inference_gflops"]),
-        "Train (GFLOPs)": np.mean(cost_curve["train_gflops"]),
+        "Eval (ms/smp)": cost_curve["eval_ms_per_sample"][-1],
+        "Inference (GFLOPs)": cost_curve["inference_gflops"][-1],
+        "Train (GFLOPs)": sum(cost_curve["train_gflops_total"]),
         "Peak Train Mem. (MB)": max(cost_curve["peak_train_mem_mb"]),
         "Params (M)": cost_curve["params_m"][-1],
         "Trainable Params (M)": cost_curve["trainable_params_m"][-1],
