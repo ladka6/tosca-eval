@@ -76,20 +76,27 @@ def parse_log(path):
 
 
 def find_runs(root):
-    """-> {dataset: [(seed, parsed_dict), ...]}"""
+    """-> {(dataset, prefix): [(seed, parsed_dict), ...]}
+
+    Grouping must include prefix, not just dataset: different prefixes under
+    the same model_name/dataset folder (e.g. the batch-mode TOSCA baseline,
+    prefix=" ", vs. the per-sample-entropy ablation, prefix="persample")
+    are different experiments that happen to share a log directory -- if
+    keyed by dataset alone their seeds get silently averaged together."""
     runs = defaultdict(list)
     for path in glob.glob(os.path.join(root, "tosca", "*", "*", "*", "*.log")):
         # logs/tosca/<dataset>/<init_cls>/<increment>/<prefix>_<seed>_<backbone>.log
         parts = path.split(os.sep)
         dataset = parts[-4]
         fname = parts[-1]
-        m = re.search(r"_(\d{4})_", fname)
-        seed = m.group(1) if m else "?"
+        m = re.search(r"^(.*?)_(\d{4})_", fname)
+        prefix = m.group(1).strip() if m else "?"
+        seed = m.group(2) if m else "?"
         parsed = parse_log(path)
         if parsed is None:
             print(f"skipping (incomplete/unparseable): {path}")
             continue
-        runs[dataset].append((seed, parsed))
+        runs[(dataset, prefix)].append((seed, parsed))
     return runs
 
 
@@ -109,25 +116,30 @@ def main():
 
     runs = find_runs(args.root)
 
+    def label(prefix):
+        return prefix if prefix else "(default)"
+
     print("\n=== Accuracy (mean +/- std over seeds) ===")
     acc_rows = []
-    for dataset in sorted(runs):
-        entries = runs[dataset]
+    for dataset, prefix in sorted(runs):
+        entries = runs[(dataset, prefix)]
         seeds = [s for s, _ in entries]
         avg_acc = fmt([e["avg_inc_acc"] for _, e in entries])
         final_top1 = fmt([e["final_top1"] for _, e in entries])
         n = len(entries)
-        print(f"{dataset:16s}  n_seeds={n}  seeds={seeds}  Abar={avg_acc:>16s}  A_T={final_top1:>16s}")
-        acc_rows.append([dataset, n, ",".join(seeds), avg_acc, final_top1])
+        tag = f"{dataset}[{label(prefix)}]"
+        print(f"{tag:28s}  n_seeds={n}  seeds={seeds}  Abar={avg_acc:>16s}  A_T={final_top1:>16s}")
+        acc_rows.append([dataset, prefix, n, ",".join(seeds), avg_acc, final_top1])
 
     print("\n=== Efficiency (mean +/- std over seeds) ===")
     eff_rows = []
-    header = f"{'dataset':16s}" + "".join(f"{k:>24s}" for k in COST_KEYS)
+    header = f"{'dataset[prefix]':28s}" + "".join(f"{k:>24s}" for k in COST_KEYS)
     print(header)
-    for dataset in sorted(runs):
-        entries = runs[dataset]
-        row = [dataset]
-        line = f"{dataset:16s}"
+    for dataset, prefix in sorted(runs):
+        entries = runs[(dataset, prefix)]
+        row = [dataset, prefix]
+        tag = f"{dataset}[{label(prefix)}]"
+        line = f"{tag:28s}"
         for key in COST_KEYS:
             val = fmt([e.get(key) for _, e in entries])
             line += f"{val:>24s}"
@@ -138,11 +150,11 @@ def main():
     os.makedirs("results", exist_ok=True)
     with open("results/accuracy.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["dataset", "n_seeds", "seeds", "avg_inc_acc", "final_top1"])
+        w.writerow(["dataset", "prefix", "n_seeds", "seeds", "avg_inc_acc", "final_top1"])
         w.writerows(acc_rows)
     with open("results/efficiency.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["dataset"] + COST_KEYS)
+        w.writerow(["dataset", "prefix"] + COST_KEYS)
         w.writerows(eff_rows)
     print("\nWrote results/accuracy.csv and results/efficiency.csv")
 
