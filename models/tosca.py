@@ -188,14 +188,42 @@ class Learner(BaseLearner):
         task_idx = int(torch.argmin(torch.tensor(entropies)))
 
         return logits_list[task_idx]
-    
+
+    def get_persample_lowentropy_logits(self, inputs):
+        """Ablation: same entropy-based expert selection as get_lowentropy_logits,
+        but the argmin is taken per sample instead of over the batch-mean entropy,
+        so each sample in a mixed batch can pick its own lowest-entropy expert.
+        Isolates whether TOSCA's shuffle-sensitivity comes from the batch-level
+        aggregation specifically, independent of any routing mechanism."""
+        logits_list = []
+        entropy_list = []
+        for i in range(self._cur_task + 1):
+            self._load_tosca(i)
+            outputs = self._network(inputs)["logits"]
+            logits_list.append(outputs)
+            probabilities = F.softmax(outputs, dim=1)
+            per_sample_entropy = -torch.sum(
+                probabilities * torch.log(probabilities + 1e-9), dim=1
+            )  # [B]
+            entropy_list.append(per_sample_entropy)
+
+        entropies = torch.stack(entropy_list, dim=0)  # [T, B]
+        logits = torch.stack(logits_list, dim=0)      # [T, B, C]
+        chosen_task = torch.argmin(entropies, dim=0)  # [B], per-sample argmin
+        batch_idx = torch.arange(inputs.size(0), device=inputs.device)
+        return logits[chosen_task, batch_idx]  # [B, C]
+
     def _eval_cnn(self, loader):
         self._network.eval()
         y_pred, y_true = [], []
+        routing_mode = str(self.args.get("routing_mode", "batch"))
         for i, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
-                outputs=self.get_lowentropy_logits(inputs)
+                if routing_mode == "per_sample":
+                    outputs = self.get_persample_lowentropy_logits(inputs)
+                else:
+                    outputs = self.get_lowentropy_logits(inputs)
             predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]  # [bs, topk]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
