@@ -21,6 +21,13 @@ class Learner(BaseLearner):
         self.args = args
 
     def incremental_train(self, data_manager):
+        # Timing/memory scope matches the baseline repos' PhaseTimer, which
+        # wraps the entire incremental_train call: loader setup, the gradient
+        # loop, checkpoint saving, and replace_fc all count as training cost.
+        # Evaluation is never inside this scope.
+        if self._device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self._device)
+        self._task_train_start = time.time()
         self._cur_task += 1
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
         self._network.update_fc(self._total_classes)
@@ -41,10 +48,6 @@ class Learner(BaseLearner):
         self._network.to(self._device)
         optimizer = self.get_optimizer(lr=self.args["lr"])
         scheduler = self.get_scheduler(optimizer, self.args["epochs"])
-
-        if self._device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(self._device)
-        train_start = time.time()
 
         prog_bar = tqdm(range(self.args["epochs"]))
         for _, epoch in enumerate(prog_bar):
@@ -77,36 +80,30 @@ class Learner(BaseLearner):
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
-            if epoch % 5 == 0:
-                test_acc = self._compute_accuracy(self._network, self.test_loader)
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
-                    self._cur_task,
-                    epoch + 1,
-                    self.args["epochs"],
-                    losses / len(self.train_loader),
-                    train_acc,
-                    test_acc,
-                )
-            else:
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
-                    self._cur_task,
-                    epoch + 1,
-                    self.args["epochs"],
-                    losses / len(self.train_loader),
-                    train_acc,
-                )
+            # No test-set evaluation inside this loop: the every-5-epochs
+            # _compute_accuracy call that used to live here ran a full
+            # forward pass over the ENTIRE seen-classes test set within the
+            # timed training region, inflating the reported train time by the
+            # (growing) test-set eval cost -- ~4 evals/task on a test set
+            # growing every task, which no other method's timed region does.
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+                self._cur_task,
+                epoch + 1,
+                self.args["epochs"],
+                losses / len(self.train_loader),
+                train_acc,
+            )
             prog_bar.set_description(info)
 
-        self.metrics["train_time_min"] = (time.time() - train_start) / 60
+        logging.info(info)
+        self._save_tosca()
+        self.replace_fc()
+        self.metrics["train_time_min"] = (time.time() - self._task_train_start) / 60
         self.metrics["peak_train_mem_mb"] = (
             torch.cuda.max_memory_allocated(self._device) / (1024 ** 2)
             if self._device.type == "cuda"
             else 0.0
         )
-
-        logging.info(info)
-        self._save_tosca()
-        self.replace_fc()
 
     def _measure_train_step_gflops(self, sample_inputs, sample_targets):
         with FlopCounterMode(display=False) as flop_counter:
@@ -129,6 +126,17 @@ class Learner(BaseLearner):
             for i, (_, data, label) in enumerate(self.train_loader_for_protonet):
                 data = data.to(self._device)
                 label = label.long().to(self._device)
+                if "extract_gflops_per_sample" not in self.metrics:
+                    # One no-grad forward's FLOPs, measured once -- this
+                    # prototype-extraction pass is a real full sweep over the
+                    # task's train set, and the baseline repos' profiled
+                    # Train GFLOPs include their equivalent pass, so the
+                    # trainer adds samples x this to each task's total.
+                    with FlopCounterMode(display=False) as flop_counter:
+                        self._network.backbone(data[:1])
+                    self.metrics["extract_gflops_per_sample"] = (
+                        flop_counter.get_total_flops() / 1e9
+                    )
                 embedding = self._network.backbone(data)
                 embedding_list.append(embedding.cpu())
                 label_list.append(label.cpu())

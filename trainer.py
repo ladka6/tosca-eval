@@ -78,13 +78,26 @@ def _train(args):
     }
 
     for task in range(data_manager.nb_tasks):
-        params_m = count_parameters(model._network) / 1e6
-        trainable_params_m = count_parameters(model._network, True) / 1e6
         logging.info("All params: {}".format(count_parameters(model._network)))
         logging.info(
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
         model.incremental_train(data_manager)
+
+        # Counted AFTER incremental_train so fc already covers this task's
+        # classes, matching when the baseline repos' trainer counts.
+        # count_parameters only sees the network -- i.e. the ONE currently
+        # loaded tosca adapter -- but the deployed model also needs the
+        # `task` adapters already saved to disk for earlier tasks (eval
+        # reloads every one of them per batch), so add those to the total.
+        # Trainable is honest as-is: the in-network adapter + fc are exactly
+        # what this task's gradient loop updates.
+        tosca_adapter_params = sum(
+            p.numel() for p in model._network.backbone.tosca.parameters()
+        )
+        params_m = (count_parameters(model._network) + task * tosca_adapter_params) / 1e6
+        trainable_params_m = count_parameters(model._network, True) / 1e6
+
         train_samples = len(model.train_loader.dataset)
         cnn_accy, nme_accy = model.eval_task()
         model.after_task()
@@ -97,8 +110,13 @@ def _train(args):
         # ["train_gflops"] is the real measured forward+backward cost of ONE
         # sample (via FlopCounterMode on the task's first training step);
         # scale it up to this task's total before summing across tasks.
+        # replace_fc's prototype-extraction pass (one no-grad forward over
+        # the task's train set) is real per-task work that the other repos'
+        # profiled totals include, so add it here too -- once per task, NOT
+        # multiplied by the epoch count.
         task_train_gflops_total = (
             model.metrics.get("train_gflops", 0.0) * train_samples * args["epochs"]
+            + model.metrics.get("extract_gflops_per_sample", 0.0) * train_samples
         )
 
         cost_curve["train_time_min"].append(model.metrics.get("train_time_min", 0.0))
