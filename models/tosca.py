@@ -21,12 +21,16 @@ class Learner(BaseLearner):
         self.args = args
 
     def incremental_train(self, data_manager):
-        # Timing/memory scope matches the baseline repos' PhaseTimer, which
-        # wraps the entire incremental_train call: loader setup, the gradient
-        # loop, checkpoint saving, and replace_fc all count as training cost.
-        # Evaluation is never inside this scope.
-        if self._device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(self._device)
+        # Wall-clock start covers the WHOLE incremental_train scope (loader
+        # setup, gradient loop, checkpoint save, replace_fc), matching the
+        # baseline repos' PhaseTimer. The peak-memory reset stays inside
+        # _train, right after the network is first moved onto the device
+        # (see below) -- calling torch.cuda.reset_peak_memory_stats before
+        # ANY tensor has touched this device in the process (true on task
+        # 0's very first call, since the network is still on CPU here)
+        # raises "RuntimeError: Invalid device argument" on this cluster's
+        # driver/CUDA combination, because the per-device allocator isn't
+        # initialized until first use.
         self._task_train_start = time.time()
         self._cur_task += 1
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
@@ -48,6 +52,9 @@ class Learner(BaseLearner):
         self._network.to(self._device)
         optimizer = self.get_optimizer(lr=self.args["lr"])
         scheduler = self.get_scheduler(optimizer, self.args["epochs"])
+
+        if self._device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self._device)
 
         prog_bar = tqdm(range(self.args["epochs"]))
         for _, epoch in enumerate(prog_bar):
